@@ -2,40 +2,40 @@
 //! This module encapsulates the `unsafe` access to `hashbrown::raw::RawTable`,
 //! mostly in dealing with its bucket "pointers".
 
-use super::{Entry, Equivalent, HashValue, IndexMapCore, VacantEntry};
+use super::{Entry, Equivalent, HashValue, IndexMapCore, Indexable, VacantEntry};
 use crate::util::enumerate;
 use core::fmt;
 use core::mem::replace;
 use hashbrown::raw::RawTable;
 
-type RawBucket = hashbrown::raw::Bucket<usize>;
+type RawBucket<Idx> = hashbrown::raw::Bucket<Idx>;
 
-pub(super) struct DebugIndices<'a>(pub &'a RawTable<usize>);
-impl fmt::Debug for DebugIndices<'_> {
+pub(super) struct DebugIndices<'a, Idx>(pub &'a RawTable<Idx>);
+impl<Idx: fmt::Debug> fmt::Debug for DebugIndices<'_, Idx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let indices = unsafe { self.0.iter().map(|raw_bucket| raw_bucket.read()) };
         f.debug_list().entries(indices).finish()
     }
 }
 
-impl<K, V> IndexMapCore<K, V> {
+impl<K, V, Idx: Indexable> IndexMapCore<K, V, Idx> {
     /// Return the raw bucket with an equivalent key
-    fn find_equivalent<Q>(&self, hash: HashValue, key: &Q) -> Option<RawBucket>
+    fn find_equivalent<Q>(&self, hash: HashValue, key: &Q) -> Option<RawBucket<Idx>>
     where
         Q: ?Sized + Equivalent<K>,
     {
         self.indices.find(hash.get(), {
-            move |&i| Q::equivalent(key, &self.entries[i].key)
+            move |&i| Q::equivalent(key, &self.entries[i.into_usize()].key)
         })
     }
 
     /// Return the raw bucket for the given index
-    fn find_index(&self, hash: HashValue, index: usize) -> Option<RawBucket> {
+    fn find_index(&self, hash: HashValue, index: Idx) -> Option<RawBucket<Idx>> {
         self.indices.find(hash.get(), move |&i| i == index)
     }
 
     /// Return the index in `entries` where an equivalent key can be found
-    pub(crate) fn get_index_of<Q>(&self, hash: HashValue, key: &Q) -> Option<usize>
+    pub(crate) fn get_index_of<Q>(&self, hash: HashValue, key: &Q) -> Option<Idx>
     where
         Q: ?Sized + Equivalent<K>,
     {
@@ -49,8 +49,8 @@ impl<K, V> IndexMapCore<K, V> {
     ///
     /// The index doesn't need to be valid in `entries` while calling this.  No other index
     /// adjustments are made -- this is only used by `pop` for the greatest index.
-    pub(super) fn erase_index(&mut self, hash: HashValue, index: usize) {
-        debug_assert_eq!(index, self.indices.len() - 1);
+    pub(super) fn erase_index(&mut self, hash: HashValue, index: Idx) {
+        debug_assert_eq!(index.into_usize(), self.indices.len() - 1);
         let raw_bucket = self.find_index(hash, index).unwrap();
         unsafe { self.indices.erase(raw_bucket) };
     }
@@ -76,11 +76,13 @@ impl<K, V> IndexMapCore<K, V> {
 
             // Reinsert stable indices
             for (i, entry) in enumerate(start_entries) {
+                let i = Idx::from_usize(i);
                 self.indices.insert_no_grow(entry.hash.get(), i);
             }
 
             // Reinsert shifted indices
             for (i, entry) in (start..).zip(shifted_entries) {
+                let i = Idx::from_usize(i);
                 self.indices.insert_no_grow(entry.hash.get(), i);
             }
         } else if erased + shifted < half_capacity {
@@ -88,22 +90,26 @@ impl<K, V> IndexMapCore<K, V> {
 
             // Find erased indices
             for (i, entry) in (start..).zip(erased_entries) {
+                let i = Idx::from_usize(i);
                 let bucket = self.find_index(entry.hash, i).unwrap();
                 unsafe { self.indices.erase(bucket) };
             }
 
             // Find shifted indices
             for ((new, old), entry) in (start..).zip(end..).zip(shifted_entries) {
+                let old = Idx::from_usize(old);
                 let bucket = self.find_index(entry.hash, old).unwrap();
-                unsafe { bucket.write(new) };
+                unsafe { bucket.write(Idx::from_usize(new)) };
             }
         } else {
             // Sweep the whole table for adjustments
+            let start = Idx::from_usize(start);
+            let end = Idx::from_usize(end);
             unsafe {
                 for bucket in self.indices.iter() {
                     let i = bucket.read();
                     if i >= end {
-                        bucket.write(i - erased);
+                        bucket.write(Idx::from_usize(i.into_usize() - erased));
                     } else if i >= start {
                         self.indices.erase(bucket);
                     }
@@ -114,7 +120,7 @@ impl<K, V> IndexMapCore<K, V> {
         debug_assert_eq!(self.indices.len(), start + shifted);
     }
 
-    pub(crate) fn entry(&mut self, hash: HashValue, key: K) -> Entry<'_, K, V>
+    pub(crate) fn entry(&mut self, hash: HashValue, key: K) -> Entry<'_, K, V, Idx>
     where
         K: Eq,
     {
@@ -135,7 +141,7 @@ impl<K, V> IndexMapCore<K, V> {
     }
 
     /// Remove an entry by shifting all entries that follow it
-    pub(crate) fn shift_remove_full<Q>(&mut self, hash: HashValue, key: &Q) -> Option<(usize, K, V)>
+    pub(crate) fn shift_remove_full<Q>(&mut self, hash: HashValue, key: &Q) -> Option<(Idx, K, V)>
     where
         Q: ?Sized + Equivalent<K>,
     {
@@ -146,8 +152,8 @@ impl<K, V> IndexMapCore<K, V> {
     }
 
     /// Remove an entry by shifting all entries that follow it
-    pub(crate) fn shift_remove_index(&mut self, index: usize) -> Option<(K, V)> {
-        let raw_bucket = match self.entries.get(index) {
+    pub(crate) fn shift_remove_index(&mut self, index: Idx) -> Option<(K, V)> {
+        let raw_bucket = match self.entries.get(index.into_usize()) {
             Some(entry) => self.find_index(entry.hash, index).unwrap(),
             None => return None,
         };
@@ -161,31 +167,33 @@ impl<K, V> IndexMapCore<K, V> {
     ///
     /// Safety: The caller must pass a live `raw_bucket`.
     #[allow(unused_unsafe)]
-    unsafe fn shift_remove_bucket(&mut self, raw_bucket: RawBucket) -> (usize, K, V) {
+    unsafe fn shift_remove_bucket(&mut self, raw_bucket: RawBucket<Idx>) -> (Idx, K, V) {
         // use Vec::remove, but then we need to update the indices that point
         // to all of the other entries that have to move
         let index = unsafe { self.indices.remove(raw_bucket) };
-        let entry = self.entries.remove(index);
+        let index_usize = index.into_usize();
+        let entry = self.entries.remove(index_usize);
 
         // correct indices that point to the entries that followed the removed entry.
         // use a heuristic between a full sweep vs. a `find()` for every shifted item.
         let raw_capacity = self.indices.buckets();
-        let shifted_entries = &self.entries[index..];
+        let shifted_entries = &self.entries[index_usize..];
         if shifted_entries.len() > raw_capacity / 2 {
             // shift all indices greater than `index`
             unsafe {
                 for bucket in self.indices.iter() {
                     let i = bucket.read();
                     if i > index {
-                        bucket.write(i - 1);
+                        bucket.write(Idx::from_usize(i.into_usize() - 1));
                     }
                 }
             }
         } else {
             // find each following entry to shift its index
-            for (i, entry) in (index + 1..).zip(shifted_entries) {
+            for (i, entry) in (index_usize + 1..).zip(shifted_entries) {
+                let i = Idx::from_usize(i);
                 let shifted_bucket = self.find_index(entry.hash, i).unwrap();
-                unsafe { shifted_bucket.write(i - 1) };
+                unsafe { shifted_bucket.write(Idx::from_usize(i.into_usize() - 1)) };
             }
         }
 
@@ -193,7 +201,7 @@ impl<K, V> IndexMapCore<K, V> {
     }
 
     /// Remove an entry by swapping it with the last
-    pub(crate) fn swap_remove_full<Q>(&mut self, hash: HashValue, key: &Q) -> Option<(usize, K, V)>
+    pub(crate) fn swap_remove_full<Q>(&mut self, hash: HashValue, key: &Q) -> Option<(Idx, K, V)>
     where
         Q: ?Sized + Equivalent<K>,
     {
@@ -204,8 +212,8 @@ impl<K, V> IndexMapCore<K, V> {
     }
 
     /// Remove an entry by swapping it with the last
-    pub(crate) fn swap_remove_index(&mut self, index: usize) -> Option<(K, V)> {
-        let raw_bucket = match self.entries.get(index) {
+    pub(crate) fn swap_remove_index(&mut self, index: Idx) -> Option<(K, V)> {
+        let raw_bucket = match self.entries.get(index.into_usize()) {
             Some(entry) => self.find_index(entry.hash, index).unwrap(),
             None => return None,
         };
@@ -219,17 +227,18 @@ impl<K, V> IndexMapCore<K, V> {
     ///
     /// Safety: The caller must pass a live `raw_bucket`.
     #[allow(unused_unsafe)]
-    unsafe fn swap_remove_bucket(&mut self, raw_bucket: RawBucket) -> (usize, K, V) {
+    unsafe fn swap_remove_bucket(&mut self, raw_bucket: RawBucket<Idx>) -> (Idx, K, V) {
         // use swap_remove, but then we need to update the index that points
         // to the other entry that has to move
         let index = unsafe { self.indices.remove(raw_bucket) };
-        let entry = self.entries.swap_remove(index);
+        let index_usize = index.into_usize();
+        let entry = self.entries.swap_remove(index_usize);
 
         // correct index that points to the entry that had to swap places
-        if let Some(entry) = self.entries.get(index) {
+        if let Some(entry) = self.entries.get(index_usize) {
             // was not last element
             // examine new element in `index` and find it in indices
-            let last = self.entries.len();
+            let last = Idx::from_usize(self.entries.len());
             let swapped_bucket = self.find_index(entry.hash, last).unwrap();
             unsafe { swapped_bucket.write(index) };
         }
@@ -246,7 +255,8 @@ impl<K, V> IndexMapCore<K, V> {
         unsafe {
             for raw_bucket in self.indices.iter() {
                 let i = raw_bucket.read();
-                raw_bucket.write(len - i - 1);
+                let j = len - i.into_usize() - 1;
+                raw_bucket.write(Idx::from_usize(j));
             }
         }
     }
@@ -258,46 +268,51 @@ impl<K, V> IndexMapCore<K, V> {
 /// [`Entry`]: enum.Entry.html
 // SAFETY: The lifetime of the map reference also constrains the raw bucket,
 // which is essentially a raw pointer into the map indices.
-pub struct OccupiedEntry<'a, K, V> {
-    map: &'a mut IndexMapCore<K, V>,
-    raw_bucket: RawBucket,
+pub struct OccupiedEntry<'a, K, V, Idx = usize> {
+    map: &'a mut IndexMapCore<K, V, Idx>,
+    raw_bucket: RawBucket<Idx>,
     key: K,
 }
 
 // `hashbrown::raw::Bucket` is only `Send`, not `Sync`.
 // SAFETY: `&self` only accesses the bucket to read it.
-unsafe impl<K: Sync, V: Sync> Sync for OccupiedEntry<'_, K, V> {}
+unsafe impl<K: Sync, V: Sync, Idx: Sync> Sync for OccupiedEntry<'_, K, V, Idx> {}
 
 // The parent module also adds methods that don't threaten the unsafe encapsulation.
-impl<'a, K, V> OccupiedEntry<'a, K, V> {
+impl<'a, K, V, Idx: Indexable> OccupiedEntry<'a, K, V, Idx> {
     pub fn key(&self) -> &K {
         &self.key
     }
 
     pub fn get(&self) -> &V {
-        &self.map.entries[self.index()].value
+        &self.map.entries[self.index_usize()].value
     }
 
     pub fn get_mut(&mut self) -> &mut V {
-        let index = self.index();
+        let index = self.index_usize();
         &mut self.map.entries[index].value
     }
 
     /// Put the new key in the occupied entry's key slot
     pub(crate) fn replace_key(self) -> K {
-        let index = self.index();
+        let index = self.index_usize();
         let old_key = &mut self.map.entries[index].key;
         replace(old_key, self.key)
     }
 
     /// Return the index of the key-value pair
     #[inline]
-    pub fn index(&self) -> usize {
+    pub fn index(&self) -> Idx {
         unsafe { self.raw_bucket.read() }
     }
 
+    #[inline]
+    fn index_usize(&self) -> usize {
+        self.index().into_usize()
+    }
+
     pub fn into_mut(self) -> &'a mut V {
-        let index = self.index();
+        let index = self.index_usize();
         &mut self.map.entries[index].value
     }
 

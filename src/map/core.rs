@@ -18,26 +18,28 @@ use core::mem::replace;
 use core::ops::RangeBounds;
 
 use crate::equivalent::Equivalent;
+use crate::indexable::Indexable;
 use crate::util::{enumerate, simplify_range};
-use crate::{Bucket, Entries, HashValue};
+use crate::{Bucket, Entries, HashValue, WithEntries};
 
 /// Core of the map that does not depend on S
-pub(crate) struct IndexMapCore<K, V> {
+pub(crate) struct IndexMapCore<K, V, Idx = usize> {
     /// indices mapping from the entry hash to its index.
-    indices: RawTable<usize>,
+    indices: RawTable<Idx>,
     /// entries is a dense vec of entries in their order.
     entries: Vec<Bucket<K, V>>,
 }
 
 #[inline(always)]
-fn get_hash<K, V>(entries: &[Bucket<K, V>]) -> impl Fn(&usize) -> u64 + '_ {
-    move |&i| entries[i].hash.get()
+fn get_hash<K, V, Idx: Indexable>(entries: &[Bucket<K, V>]) -> impl Fn(&Idx) -> u64 + '_ {
+    move |&i| entries[i.into_usize()].hash.get()
 }
 
-impl<K, V> Clone for IndexMapCore<K, V>
+impl<K, V, Idx> Clone for IndexMapCore<K, V, Idx>
 where
     K: Clone,
     V: Clone,
+    Idx: Indexable,
 {
     fn clone(&self) -> Self {
         let indices = self.indices.clone();
@@ -57,10 +59,11 @@ where
     }
 }
 
-impl<K, V> fmt::Debug for IndexMapCore<K, V>
+impl<K, V, Idx> fmt::Debug for IndexMapCore<K, V, Idx>
 where
     K: fmt::Debug,
     V: fmt::Debug,
+    Idx: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IndexMapCore")
@@ -70,7 +73,7 @@ where
     }
 }
 
-impl<K, V> Entries for IndexMapCore<K, V> {
+impl<K, V, Idx> Entries for IndexMapCore<K, V, Idx> {
     type Entry = Bucket<K, V>;
 
     #[inline]
@@ -87,7 +90,9 @@ impl<K, V> Entries for IndexMapCore<K, V> {
     fn as_entries_mut(&mut self) -> &mut [Self::Entry] {
         &mut self.entries
     }
+}
 
+impl<K, V, Idx: Indexable> WithEntries for IndexMapCore<K, V, Idx> {
     fn with_entries<F>(&mut self, f: F)
     where
         F: FnOnce(&mut [Self::Entry]),
@@ -97,7 +102,7 @@ impl<K, V> Entries for IndexMapCore<K, V> {
     }
 }
 
-impl<K, V> IndexMapCore<K, V> {
+impl<K, V, Idx> IndexMapCore<K, V, Idx> {
     #[inline]
     pub(crate) fn new() -> Self {
         IndexMapCore {
@@ -129,9 +134,17 @@ impl<K, V> IndexMapCore<K, V> {
         self.entries.clear();
     }
 
+    /// Reserve entries capacity to match the indices
+    fn reserve_entries(&mut self) {
+        let additional = self.indices.capacity() - self.entries.len();
+        self.entries.reserve_exact(additional);
+    }
+}
+
+impl<K, V, Idx: Indexable> IndexMapCore<K, V, Idx> {
     pub(crate) fn drain<R>(&mut self, range: R) -> Drain<'_, Bucket<K, V>>
     where
-        R: RangeBounds<usize>,
+        R: RangeBounds<Idx>,
     {
         let range = simplify_range(range, self.entries.len());
         self.erase_indices(range.start, range.end);
@@ -144,12 +157,6 @@ impl<K, V> IndexMapCore<K, V> {
         self.reserve_entries();
     }
 
-    /// Reserve entries capacity to match the indices
-    fn reserve_entries(&mut self) {
-        let additional = self.indices.capacity() - self.entries.len();
-        self.entries.reserve_exact(additional);
-    }
-
     /// Shrink the capacity of the map as much as possible.
     pub(crate) fn shrink_to_fit(&mut self) {
         self.indices.shrink_to(0, get_hash(&self.entries));
@@ -159,7 +166,7 @@ impl<K, V> IndexMapCore<K, V> {
     /// Remove the last key-value pair
     pub(crate) fn pop(&mut self) -> Option<(K, V)> {
         if let Some(entry) = self.entries.pop() {
-            let last = self.entries.len();
+            let last = Idx::from_usize(self.entries.len());
             self.erase_index(entry.hash, last);
             Some((entry.key, entry.value))
         } else {
@@ -169,10 +176,11 @@ impl<K, V> IndexMapCore<K, V> {
 
     /// Append a key-value pair, *without* checking whether it already exists,
     /// and return the pair's new index.
-    fn push(&mut self, hash: HashValue, key: K, value: V) -> usize {
-        let i = self.entries.len();
+    fn push(&mut self, hash: HashValue, key: K, value: V) -> Idx {
+        let len = self.entries.len();
+        let i = Idx::from_usize(len);
         self.indices.insert(hash.get(), i, get_hash(&self.entries));
-        if i == self.entries.capacity() {
+        if len == self.entries.capacity() {
             // Reserve our own capacity synced to the indices,
             // rather than letting `Vec::push` just double it.
             self.reserve_entries();
@@ -181,12 +189,15 @@ impl<K, V> IndexMapCore<K, V> {
         i
     }
 
-    pub(crate) fn insert_full(&mut self, hash: HashValue, key: K, value: V) -> (usize, Option<V>)
+    pub(crate) fn insert_full(&mut self, hash: HashValue, key: K, value: V) -> (Idx, Option<V>)
     where
         K: Eq,
     {
         match self.get_index_of(hash, &key) {
-            Some(i) => (i, Some(replace(&mut self.entries[i].value, value))),
+            Some(i) => {
+                let old_value = &mut self.entries[i.into_usize()].value;
+                (i, Some(replace(old_value, value)))
+            }
             None => (self.push(hash, key, value), None),
         }
     }
@@ -221,6 +232,7 @@ impl<K, V> IndexMapCore<K, V> {
         self.indices.clear();
         debug_assert!(self.indices.capacity() >= self.entries.len());
         for (i, entry) in enumerate(&self.entries) {
+            let i = Idx::from_usize(i);
             // We should never have to reallocate, so there's no need for a real hasher.
             self.indices.insert_no_grow(entry.hash.get(), i);
         }
@@ -229,14 +241,14 @@ impl<K, V> IndexMapCore<K, V> {
 
 /// Entry for an existing key-value pair or a vacant location to
 /// insert one.
-pub enum Entry<'a, K, V> {
+pub enum Entry<'a, K, V, Idx = usize> {
     /// Existing slot with equivalent key.
-    Occupied(OccupiedEntry<'a, K, V>),
+    Occupied(OccupiedEntry<'a, K, V, Idx>),
     /// Vacant slot (no equivalent key in the map).
-    Vacant(VacantEntry<'a, K, V>),
+    Vacant(VacantEntry<'a, K, V, Idx>),
 }
 
-impl<'a, K, V> Entry<'a, K, V> {
+impl<'a, K, V, Idx: Indexable> Entry<'a, K, V, Idx> {
     /// Computes in **O(1)** time (amortized average).
     pub fn or_insert(self, default: V) -> &'a mut V {
         match self {
@@ -264,7 +276,7 @@ impl<'a, K, V> Entry<'a, K, V> {
     }
 
     /// Return the index where the key-value pair exists or will be inserted.
-    pub fn index(&self) -> usize {
+    pub fn index(&self) -> Idx {
         match *self {
             Entry::Occupied(ref entry) => entry.index(),
             Entry::Vacant(ref entry) => entry.index(),
@@ -300,7 +312,12 @@ impl<'a, K, V> Entry<'a, K, V> {
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Entry<'_, K, V> {
+impl<K, V, Idx> fmt::Debug for Entry<'_, K, V, Idx>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+    Idx: fmt::Debug + Indexable,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Entry::Vacant(ref v) => f.debug_tuple(stringify!(Entry)).field(v).finish(),
@@ -312,7 +329,7 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Entry<'_, K, V> {
 pub use self::raw::OccupiedEntry;
 
 // Extra methods that don't threaten the unsafe encapsulation.
-impl<K, V> OccupiedEntry<'_, K, V> {
+impl<K, V, Idx: Indexable> OccupiedEntry<'_, K, V, Idx> {
     /// Sets the value of the entry to `value`, and returns the entry's old value.
     pub fn insert(&mut self, value: V) -> V {
         replace(self.get_mut(), value)
@@ -355,7 +372,12 @@ impl<K, V> OccupiedEntry<'_, K, V> {
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for OccupiedEntry<'_, K, V> {
+impl<K, V, Idx> fmt::Debug for OccupiedEntry<'_, K, V, Idx>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+    Idx: fmt::Debug + Indexable,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct(stringify!(OccupiedEntry))
             .field("key", self.key())
@@ -368,13 +390,13 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for OccupiedEntry<'_, K, V> {
 /// It is part of the [`Entry`] enum.
 ///
 /// [`Entry`]: enum.Entry.html
-pub struct VacantEntry<'a, K, V> {
-    map: &'a mut IndexMapCore<K, V>,
+pub struct VacantEntry<'a, K, V, Idx = usize> {
+    map: &'a mut IndexMapCore<K, V, Idx>,
     hash: HashValue,
     key: K,
 }
 
-impl<'a, K, V> VacantEntry<'a, K, V> {
+impl<'a, K, V, Idx: Indexable> VacantEntry<'a, K, V, Idx> {
     pub fn key(&self) -> &K {
         &self.key
     }
@@ -384,17 +406,21 @@ impl<'a, K, V> VacantEntry<'a, K, V> {
     }
 
     /// Return the index where the key-value pair will be inserted.
-    pub fn index(&self) -> usize {
-        self.map.len()
+    pub fn index(&self) -> Idx {
+        Idx::from_usize(self.map.len())
     }
 
     pub fn insert(self, value: V) -> &'a mut V {
         let i = self.map.push(self.hash, self.key, value);
-        &mut self.map.entries[i].value
+        &mut self.map.entries[i.into_usize()].value
     }
 }
 
-impl<K: fmt::Debug, V> fmt::Debug for VacantEntry<'_, K, V> {
+impl<K, V, Idx> fmt::Debug for VacantEntry<'_, K, V, Idx>
+where
+    K: fmt::Debug,
+    Idx: fmt::Debug + Indexable,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple(stringify!(VacantEntry))
             .field(self.key())
